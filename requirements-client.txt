@@ -1,0 +1,18 @@
+# Workstation (rollout client + console). Install in your VLA client env.
+numpy
+requests
+opencv-python
+websockets
+msgpack-numpy
+openpi-client      # for cosmos/pi endpoints (optional for molmobot)
+fastapi            # console only
+uvicorn            # console only
+pyyaml
+# pyzed            # ZED SDK python (install via Stereolabs, matches your SDK version)
+# pyrealsense2     # if using RealSense instead
+
+# --- viz/ (optional 3D UI) — install on the workstation only if using viz ---
+viser
+yourdfpy
+torch          # CUDA build matching your GPU
+# curobo       # install per NVIDIA cuRobo docs (needs CUDA toolkit + CUDA_HOME)

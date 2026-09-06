@@ -1,0 +1,45 @@
+# fr3-molmobot-deploy — site configuration EXAMPLE.
+# Copy to configs/robot.yaml (git-ignored) and fill in your lab's values.
+# These values are surfaced to the services/clients via scripts/*.sh (which
+# export the matching environment variables). Nothing here is auto-loaded by
+# Python yet — the launch scripts read it. Keep secrets out of git.
+
+robot:
+  # FR3 FCI IP as reached from the RT/robot host (Desk shows it).
+  ip: "172.16.0.3"
+  # Arm service (franky_service) — runs on the RT host.
+  service_host: "0.0.0.0"
+  service_port: 54321
+  control_hz: 50
+  command_timeout_s: 0.5          # short watchdog for 15 Hz streaming
+  # Home pose (7 joints, rad). VALIDATE physically before enabling /go_home.
+  home_position: [0.0, -0.4, 0.0, -1.9, 0.0, 1.5, 0.0]
+  relative_dynamics: { velocity: 0.05, acceleration: 0.05, jerk: 0.05 }  # conservative for first tests
+
+# How the workstation reaches the services (fill RT_HOST with the RT host's LAN IP)
+hosts:
+  rt_host: "RT_HOST_IP"           # machine running franky_service + hand service
+  workstation: "0.0.0.0"          # this machine (runs the client + console + cameras)
+  gpu_host: "GPU_HOST_IP"         # machine running the MolmoBot model server
+
+gripper:
+  backend: "franka_hand"          # franka_hand (default FR3 gripper) | robotiq_2f85 | none
+  service_port: 54324             # franka_hand service port (robotiq uses 54323)
+  max_width_m: 0.08
+  # Gripper action decoding for the rollout (see docs/V3_GRIPPER_AND_IO_CONVENTIONS.md).
+  # For the Franka Hand use the --gripper panda preset in the client.
+  close_threshold: 0.5            # model gripper action > threshold => close
+  debounce: 3                     # consecutive votes before flipping open<->closed
+
+model:
+  # MolmoBot websocket server on the GPU host (started there; see server/README).
+  ws_url: "ws://GPU_HOST_IP:8000"
+  profile: "molmobot_ft"          # molmobot_official | molmobot_ft
+  # action_type must be joint_pos (absolute rad); action_horizon 16 / execute 8.
+
+cameras:
+  backend: "zed"                  # zed | realsense
+  # ZED serial numbers on THIS workstation (run scripts/list_cameras.py to find).
+  exo_front_sn: "REPLACE"
+  wrist_sn: "REPLACE"
+  # exo_left_sn / exo_right_sn only needed for cosmos/pi 3-cam policies.

@@ -1,0 +1,917 @@
+
+"""
+FR3 Franky joint-state service (streaming joint position+velocity targets via JointMotion).
+
+Run (single worker):
+  uvicorn service:app --host 0.0.0.0 --port 54321 --workers 1
+
+Example client:
+  import requests
+  nuc = "http://NUC_IP:54321"
+  requests.post(f"{nuc}/target_joint_state", json={
+      "positions": [0.0]*7,
+      "velocities": [0.0]*7,
+      "seq": 1,
+  })
+  requests.post(f"{nuc}/stop")
+
+Env:
+  FRANKY_ROBOT_IP=172.16.1.3
+  FRANKY_REL_DYN=0.05
+  CONTROL_HZ=50
+  COMMAND_TIMEOUT_S=0.5
+  ALLOWED_CLIENT_IP=192.168.1.123   # optional allowlist (direct-connect only)
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+import logging
+import os
+import threading
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+import uvicorn
+
+import numpy as np
+import franky
+
+
+LOG = logging.getLogger("franky_service")
+
+# CONSTANTS
+N_JOINTS = 7
+DEFAULT_REL_DYN = 0.2
+DEFAULT_CONTROL_HZ = 50
+DEFAULT_COMMAND_TIMEOUT_S = 10.0
+DEFAULT_ALLOWED_CLIENT_IP = "192.168.1.123"
+DEFAULT_FRANKY_ROBOT_IP = "172.16.0.3"
+DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_SERVICE_PORT = 54321
+
+EFFECTIVE_FLOAT_INF_SECONDS = 1_000_000 # This is about 2 weeks
+
+# Joint-space \"home\" pose (matches `franky_client.HOME_POSITION`).
+HOME_POSITION: List[float] = [ 0.0, -0.40, 0.0, -1.9,  0.0,  1.5, 0.0 ]
+
+
+LANDING_PAGE_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>franky_service</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 24px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: #0b0f14; color: #e6edf3; }
+      .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+      .card { background: #0f1620; border: 1px solid #223042; border-radius: 10px; padding: 14px 14px; min-width: 320px; flex: 1; }
+      .title { font-size: 16px; font-weight: 700; margin: 0 0 8px; }
+      .muted { color: #9fb2c8; }
+      pre { margin: 8px 0 0; padding: 10px; background: #0b111a; border: 1px solid #223042; border-radius: 8px; overflow: auto; max-height: 420px; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      button { background: #1f6feb; color: white; border: none; padding: 8px 12px; border-radius: 8px; cursor: pointer; }
+      button.secondary { background: #223042; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      input { background: #0b111a; color: #e6edf3; border: 1px solid #223042; border-radius: 8px; padding: 8px 10px; width: 140px; }
+      .kv { display: grid; grid-template-columns: 190px 1fr; gap: 6px 10px; font-size: 13px; }
+      .ok { color: #3fb950; }
+      .bad { color: #f85149; }
+      .plot-wrap { width: 100%%; }
+      canvas { width: 100%%; height: 320px; background: #0b111a; border: 1px solid #223042; border-radius: 8px; }
+      select { background: #0b111a; color: #e6edf3; border: 1px solid #223042; border-radius: 8px; padding: 8px 10px; }
+      .legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 12px; color: #9fb2c8; margin-top: 10px; }
+      .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <div class="card">
+        <div class="title">franky_service</div>
+        <div class="muted">Simple status dashboard (auto-refresh).</div>
+        <div style="height: 10px"></div>
+        <div class="kv">
+          <div class="muted">robot_ip</div><div><code id="robot_ip">...</code></div>
+          <div class="muted">robot_connected</div><div><code id="robot_connected">...</code></div>
+          <div class="muted">stop_latched</div><div><code id="stop_latched">...</code></div>
+          <div class="muted">has_target</div><div><code id="has_target">...</code></div>
+          <div class="muted">command_timeout_s</div><div><code id="command_timeout_s">...</code></div>
+          <div class="muted">last_control_error</div><div><code id="last_control_error">...</code></div>
+        </div>
+        <div style="height: 12px"></div>
+        <div class="row" style="gap: 10px; align-items: center;">
+          <button id="stop_btn" onclick="doStop()">Stop</button>
+          <button class="secondary" id="go_home_btn" onclick="goHome()">Go home</button>
+          <input id="timeout_input" type="number" step="0.1" min="0.001" placeholder="timeout_s" />
+          <button class="secondary" onclick="setTimeoutS()">Set timeout</button>
+          <button class="secondary" onclick="setTimeoutInfinity()">Set ∞</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="title">current_joint_state</div>
+        <div class="muted">From <code>/joint_state</code></div>
+        <pre><code id="joint_state">Loading...</code></pre>
+      </div>
+      <div class="card">
+        <div class="title">latest_target_joint_state</div>
+        <div class="muted">From <code>/target_joint_state</code></div>
+        <pre><code id="target_state">Loading...</code></pre>
+      </div>
+      <div class="card plot-wrap">
+        <div class="row" style="justify-content: space-between; align-items: center;">
+          <div>
+            <div class="title">joint positions (actual vs target)</div>
+            <div class="muted">Live plot from <code>/joint_state</code> and <code>/target_joint_state</code></div>
+          </div>
+          <div class="row" style="gap: 10px; align-items: center;">
+            <div class="muted">joint</div>
+            <select id="joint_select"></select>
+            <div class="muted">horizon</div>
+            <input id="horizon_input" type="number" step="1" min="1" placeholder="seconds" />
+            <button class="secondary" onclick="setHorizon()">Set</button>
+          </div>
+        </div>
+        <div style="height: 10px"></div>
+        <canvas id="joint_plot" width="900" height="320"></canvas>
+        <div class="legend" id="plot_legend"></div>
+      </div>
+    </div>
+    <script>
+      const robotIp = %(robot_ip_json)s;
+      const N_JOINTS = 7;
+
+      function setText(id, val, cls=null) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = (val === undefined || val === null) ? "" : String(val);
+        el.className = cls ? cls : "";
+      }
+
+      function setJson(id, obj) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = JSON.stringify(obj, null, 2);
+      }
+
+      async function fetchJson(path) {
+        const r = await fetch(path, { cache: "no-store" });
+        const txt = await r.text();
+        let data;
+        try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+        if (!r.ok) throw { status: r.status, data };
+        return data;
+      }
+
+      // ----------------------------
+      // Status refresh (1 Hz)
+      // ----------------------------
+
+      async function refreshStatusOnce() {
+        setText("robot_ip", robotIp);
+        try {
+          const [health, timeout, joint, target] = await Promise.all([
+            fetchJson("/health"),
+            fetchJson("/command_timeout"),
+            fetchJson("/joint_state").catch(e => ({ error: e })),
+            fetchJson("/target_joint_state").catch(e => ({ error: e })),
+          ]);
+
+          setText("robot_connected", health.robot_connected, health.robot_connected ? "ok" : "bad");
+          setText("stop_latched", health.stop_latched);
+          setText("has_target", health.has_target);
+          setText("last_control_error", health.last_control_error || "");
+          setText("command_timeout_s", timeout.command_timeout_s);
+
+          setJson("joint_state", joint);
+          setJson("target_state", target);
+        } catch (e) {
+          setText("last_control_error", (e && e.data) ? JSON.stringify(e.data) : String(e));
+        }
+      }
+
+      // ----------------------------
+      // Plot (data at 10 Hz; draw on updates)
+      // ----------------------------
+
+      const plot = {
+        canvas: null,
+        ctx: null,
+        // history: arrays of {t, v} values per joint
+        t0: performance.now(),
+        sampleHz: 10,
+        horizonS: 30,          // displayed time window
+        bufferS: 600,          // keep up to 10 minutes of data for instant horizon changes
+        maxPoints: 6000,       // derived from bufferS * sampleHz
+        selectedJoint: 0,
+        actual: Array.from({ length: N_JOINTS }, () => []),
+        target: Array.from({ length: N_JOINTS }, () => []),
+        colors: ["#58a6ff", "#3fb950", "#f778ba", "#ffa657", "#a371f7", "#ff7b72", "#9fb2c8"],
+        lastActual: Array.from({ length: N_JOINTS }, () => null),
+        lastTarget: Array.from({ length: N_JOINTS }, () => null),
+      };
+
+      function initJointSelect() {
+        const sel = document.getElementById("joint_select");
+        if (!sel) return;
+        sel.innerHTML = "";
+        for (let j = 0; j < N_JOINTS; j++) {
+          const opt = document.createElement("option");
+          opt.value = String(j);
+          opt.textContent = `q${j}`;
+          sel.appendChild(opt);
+        }
+        sel.value = String(plot.selectedJoint);
+        sel.addEventListener("change", () => {
+          plot.selectedJoint = Number(sel.value);
+          drawPlot();
+        });
+      }
+
+      function initHorizonInput() {
+        const inp = document.getElementById("horizon_input");
+        if (!inp) return;
+        inp.value = String(plot.horizonS);
+      }
+
+      function setHorizon() {
+        const inp = document.getElementById("horizon_input");
+        if (!inp) return;
+        const v = Number(inp.value);
+        if (!Number.isFinite(v) || v <= 0) return;
+        plot.horizonS = Math.max(1, Math.floor(v));
+        drawPlot();
+        updateLegend();
+      }
+
+      function pushPoint(series, t, v) {
+        series.push({ t, v });
+        if (series.length > plot.maxPoints) series.splice(0, series.length - plot.maxPoints);
+      }
+
+      function getSeriesRange(series) {
+        let minV = Infinity, maxV = -Infinity;
+        for (const p of series) {
+          if (!Number.isFinite(p.v)) continue;
+          if (p.v < minV) minV = p.v;
+          if (p.v > maxV) maxV = p.v;
+        }
+        if (!Number.isFinite(minV) || !Number.isFinite(maxV)) return null;
+        if (minV === maxV) {
+          const pad = Math.max(0.1, Math.abs(minV) * 0.05);
+          return { minV: minV - pad, maxV: maxV + pad };
+        }
+        const pad = (maxV - minV) * 0.08;
+        return { minV: minV - pad, maxV: maxV + pad };
+      }
+
+      function fmt(v) {
+        if (v === null || v === undefined) return "";
+        if (!Number.isFinite(v)) return "";
+        return v.toFixed(3);
+      }
+
+      function updateLegend() {
+        const el = document.getElementById("plot_legend");
+        if (!el) return;
+        const j = plot.selectedJoint;
+        const c = plot.colors[j %% plot.colors.length];
+        const a = plot.lastActual[j];
+        const t = plot.lastTarget[j];
+        el.innerHTML = `
+          <span><span class="swatch" style="background:${c}"></span>joint q${j}</span>
+          <span><b>actual</b>: ${fmt(a)} rad</span>
+          <span><b>target</b>: ${fmt(t)} rad</span>
+          <span class="muted">(solid=actual, dashed=target, horizon=${plot.horizonS}s)</span>
+        `;
+      }
+
+      function drawAxes(ctx, w, h, minV, maxV, tMin, tMax) {
+        const padL = 52, padR = 14, padT = 10, padB = 26;
+        const x0 = padL, y0 = padT, x1 = w - padR, y1 = h - padB;
+
+        // background
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = "#0b111a";
+        ctx.fillRect(0, 0, w, h);
+
+        // grid + border
+        ctx.strokeStyle = "#223042";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+
+        ctx.fillStyle = "#9fb2c8";
+        ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+
+        // y ticks
+        const yTicks = 5;
+        for (let i = 0; i <= yTicks; i++) {
+          const a = i / yTicks;
+          const y = y1 - a * (y1 - y0);
+          const v = minV + a * (maxV - minV);
+          ctx.strokeStyle = "#192434";
+          ctx.beginPath();
+          ctx.moveTo(x0, y);
+          ctx.lineTo(x1, y);
+          ctx.stroke();
+          ctx.fillStyle = "#9fb2c8";
+          ctx.fillText(v.toFixed(2), 6, y + 4);
+        }
+
+        // x ticks (seconds)
+        const xTicks = 5;
+        for (let i = 0; i <= xTicks; i++) {
+          const a = i / xTicks;
+          const x = x0 + a * (x1 - x0);
+          const t = tMin + a * (tMax - tMin);
+          ctx.strokeStyle = "#192434";
+          ctx.beginPath();
+          ctx.moveTo(x, y0);
+          ctx.lineTo(x, y1);
+          ctx.stroke();
+          ctx.fillStyle = "#9fb2c8";
+          ctx.fillText(`${t.toFixed(1)}s`, x - 14, h - 8);
+        }
+
+        return { x0, y0, x1, y1 };
+      }
+
+      function drawSeries(ctx, box, series, tMin, tMax, vMin, vMax, color, dashed=false) {
+        if (!series || series.length < 2) return;
+        const { x0, y0, x1, y1 } = box;
+        const xScale = (x1 - x0) / Math.max(1e-9, (tMax - tMin));
+        const yScale = (y1 - y0) / Math.max(1e-9, (vMax - vMin));
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.setLineDash(dashed ? [7, 6] : []);
+        ctx.beginPath();
+        let started = false;
+        for (const p of series) {
+          const t = p.t;
+          const v = p.v;
+          if (!Number.isFinite(t) || !Number.isFinite(v)) continue;
+          if (t < tMin || t > tMax) continue;
+          const x = x0 + (t - tMin) * xScale;
+          const y = y1 - (v - vMin) * yScale;
+          if (!started) {
+            ctx.moveTo(x, y);
+            started = true;
+          } else {
+            ctx.lineTo(x, y);
+          }
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      function drawPlot() {
+        if (!plot.ctx || !plot.canvas) return;
+        const j = plot.selectedJoint;
+        const aSeries = plot.actual[j];
+        const tSeries = plot.target[j];
+        const combined = aSeries.concat(tSeries);
+
+        // Use a sliding time window based on oldest/newest in combined series
+        if (combined.length < 2) return;
+        const tMax = combined[combined.length - 1].t;
+        const tMin = Math.max(combined[0].t, tMax - plot.horizonS);
+        const rA = getSeriesRange(aSeries);
+        const rT = getSeriesRange(tSeries);
+        const r = (rA && rT)
+          ? { minV: Math.min(rA.minV, rT.minV), maxV: Math.max(rA.maxV, rT.maxV) }
+          : (rA || rT);
+        if (!r) return;
+
+        const w = plot.canvas.width;
+        const h = plot.canvas.height;
+        const box = drawAxes(plot.ctx, w, h, r.minV, r.maxV, tMin, tMax);
+        const color = plot.colors[j %% plot.colors.length];
+        drawSeries(plot.ctx, box, aSeries, tMin, tMax, r.minV, r.maxV, color, false);
+        drawSeries(plot.ctx, box, tSeries, tMin, tMax, r.minV, r.maxV, color, true);
+        updateLegend();
+      }
+
+      async function refreshPlotOnce() {
+        try {
+          const [joint, target] = await Promise.all([
+            fetchJson("/joint_state"),
+            fetchJson("/target_joint_state"),
+          ]);
+
+          const now = performance.now();
+          const t = (now - plot.t0) / 1000.0;
+          const posA = (joint && Array.isArray(joint.positions)) ? joint.positions : null;
+          const posT = (target && Array.isArray(target.positions)) ? target.positions : null;
+
+          if (posA && posA.length >= N_JOINTS) {
+            for (let j = 0; j < N_JOINTS; j++) {
+              const v = Number(posA[j]);
+              if (Number.isFinite(v)) {
+                pushPoint(plot.actual[j], t, v);
+                plot.lastActual[j] = v;
+              }
+            }
+          }
+
+          if (posT && posT.length >= N_JOINTS) {
+            for (let j = 0; j < N_JOINTS; j++) {
+              const v = Number(posT[j]);
+              if (Number.isFinite(v)) {
+                pushPoint(plot.target[j], t, v);
+                plot.lastTarget[j] = v;
+              }
+            }
+          }
+
+          drawPlot();
+        } catch (e) {
+          // ignore transient errors (e.g., robot disconnected)
+        }
+      }
+
+      async function doStop() {
+        const btn = document.getElementById("stop_btn");
+        if (btn) btn.disabled = true;
+        try {
+          await fetch("/stop", { method: "POST" });
+        } finally {
+          if (btn) btn.disabled = false;
+          await refreshOnce();
+        }
+      }
+
+      async function goHome() {
+        const btn = document.getElementById("go_home_btn");
+        if (btn) btn.disabled = true;
+        try {
+          await fetch("/go_home", { method: "POST" });
+        } finally {
+          if (btn) btn.disabled = false;
+          await refreshOnce();
+        }
+      }
+
+      async function setTimeoutS() {
+        const raw = document.getElementById("timeout_input").value;
+        if (!raw) return;
+        const v = Number(raw);
+        if (!Number.isFinite(v) || v <= 0) return;
+        await fetch("/command_timeout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command_timeout_s: v }),
+        });
+        await refreshOnce();
+      }
+
+      async function setTimeoutInfinity() {
+        // JSON has no Infinity. Use a very large timeout.
+        await fetch("/command_timeout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command_timeout_s: 1e12 }),
+        });
+        await refreshOnce();
+      }
+
+      function refreshOnce() {
+        // Backwards compatibility for button handlers (stop / set timeout),
+        // but keep status refresh separate from plot refresh loops.
+        return refreshStatusOnce();
+      }
+
+      // init
+      plot.canvas = document.getElementById("joint_plot");
+      plot.ctx = plot.canvas ? plot.canvas.getContext("2d") : null;
+      plot.maxPoints = Math.max(10, Math.floor(plot.bufferS * plot.sampleHz));
+      initJointSelect();
+      initHorizonInput();
+      updateLegend();
+      refreshStatusOnce();
+      refreshPlotOnce();
+
+      // loops
+      setInterval(refreshStatusOnce, 1000);
+      setInterval(refreshPlotOnce, Math.floor(1000 / plot.sampleHz));
+    </script>
+  </body>
+</html>
+"""
+
+
+def _get_env_float(name: str, default: float) -> float:
+    """Read float env var with a default."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
+
+
+def _get_env_int(name: str, default: int) -> int:
+    """Read int env var with a default."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+
+def _validate_vec(name: str, values: list[float], n: int = N_JOINTS) -> None:
+    """Validate a numeric vector payload."""
+    if len(values) != n:
+        raise HTTPException(status_code=400, detail=f"{name} must have length {n}")
+    for v in values:
+        if not isinstance(v, (float, int)):
+            raise HTTPException(status_code=400, detail=f"{name} must contain numbers")
+        fv = float(v)
+        if not (fv == fv) or fv in (float("inf"), float("-inf")):
+            raise HTTPException(status_code=400, detail=f"{name} must contain finite values (no NaN/Inf)")
+
+
+# DATA MODELS
+
+class JointTargetIn(BaseModel):
+    positions: list[float] = Field(..., description="Joint positions (rad), length 7")
+    velocities: list[float] = Field(..., description="Joint velocities (rad/s), length 7")
+    seq: Optional[int] = Field(default=None, description="Optional client sequence number")
+
+
+class JointTargetOut(BaseModel):
+    positions: list[float]
+    velocities: list[float]
+    seq: Optional[int]
+    accepted_timestamp_s: float
+    age_s: float
+    stop_latched: bool
+
+
+class StopOut(BaseModel):
+    stopped: bool
+    timestamp_s: float
+
+
+class CommandTimeoutIn(BaseModel):
+    command_timeout_s: float = Field(..., gt=0.0, description="Stop if target is older than this (seconds).")
+
+
+class CommandTimeoutOut(BaseModel):
+    command_timeout_s: float
+
+
+
+# INTERNAL STATE
+
+@dataclass
+class LatestTarget:
+    positions: list[float]
+    velocities: list[float]
+    seq: Optional[int]
+    accepted_timestamp_s: float
+
+
+@dataclass
+class AppState:
+    robot: object | None
+    lock: threading.Lock
+    latest_target: LatestTarget | None
+    stop_latched: bool
+    shutdown: threading.Event
+    control_thread: threading.Thread | None
+    last_control_error: str | None
+    command_timeout_s: float
+
+
+# INTERNAL FUNCTIONS
+
+def _require_robot(st: AppState):
+    """Return robot handle or raise 503."""
+    if st.robot is None:
+        raise HTTPException(status_code=503, detail="robot not available (is franky-control installed and robot reachable?)")
+    return st.robot
+
+
+def _try_recover_from_errors(*, st: AppState, context: str, exc: Exception | None = None) -> None:
+    """
+    Best-effort error recovery hook.
+
+    Franky can enter an error state after motion/preemption/comm faults; attempt to recover
+    whenever an exception occurs so subsequent commands have a chance to work.
+    """
+    robot = st.robot
+    if robot is None:
+        return
+    try:
+        robot.recover_from_errors()
+    except Exception as e:
+        # Keep the original error as primary; append recovery failure details.
+        base = f"{type(exc).__name__}: {exc}" if exc is not None else None
+        extra = f"recover_from_errors failed ({context}): {type(e).__name__}: {e}"
+        with st.lock:
+            st.last_control_error = (f"{base} | {extra}" if base else extra)
+
+
+def _control_loop(*, st: AppState, control_hz: int, timeout_s: float) -> None:
+    """Apply latest target at a fixed rate using Franky JointMotion(JointState(...))."""
+    period_s = 1.0 / float(control_hz)
+
+    robot = st.robot
+    assert robot is not None
+    robot.recover_from_errors()
+
+    while not st.shutdown.is_set():
+        time.sleep(period_s)
+
+        with st.lock:
+            latest = st.latest_target
+            stop_latched = st.stop_latched
+            timeout_s = st.command_timeout_s
+
+        if stop_latched or latest is None:
+            continue
+
+        age_s = time.time() - latest.accepted_timestamp_s
+        if age_s > timeout_s:
+            try:
+                robot.move(franky.JointStopMotion())
+            except Exception as e:
+                st.last_control_error = f"{type(e).__name__}: {e}"
+                _try_recover_from_errors(st=st, context="timeout_stop", exc=e)
+            finally:
+                with st.lock:
+                    st.stop_latched = True
+                    st.latest_target = None
+            continue
+
+        try:
+            target = franky.JointState(latest.positions, latest.velocities)
+            # Keep holding the last target until preempted (better streaming behavior).
+            motion = franky.JointMotion(target)
+            robot.move(motion, asynchronous=True)
+            st.last_control_error = None
+        except Exception as e:
+            st.last_control_error = f"{type(e).__name__}: {e}"
+            _try_recover_from_errors(st=st, context="move_joint_motion", exc=e)
+            with st.lock:
+                st.stop_latched = True
+                st.latest_target = None
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Initialize robot and start control thread."""
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL))
+
+    robot_ip = os.getenv("FRANKY_ROBOT_IP", DEFAULT_FRANKY_ROBOT_IP)
+    rel_dyn = _get_env_float("FRANKY_REL_DYN", DEFAULT_REL_DYN)
+    control_hz = _get_env_int("CONTROL_HZ", DEFAULT_CONTROL_HZ)
+    timeout_s = _get_env_float("COMMAND_TIMEOUT_S", DEFAULT_COMMAND_TIMEOUT_S)
+
+    st = AppState(
+        robot=None,
+        lock=threading.Lock(),
+        latest_target=None,
+        stop_latched=True,  # start latched until first target is posted
+        shutdown=threading.Event(),
+        control_thread=None,
+        last_control_error=None,
+        command_timeout_s=timeout_s,
+    )
+    app.state.franky_state = st
+    st.robot = franky.Robot(robot_ip)
+    st.robot.relative_dynamics_factor = franky.RelativeDynamicsFactor(0.3, 0.2, 0.1)
+
+
+    # Start background control thread (single uvicorn worker).
+    if st.robot is not None:
+        st.control_thread = threading.Thread(
+            target=_control_loop,
+            kwargs={"st": st, "control_hz": control_hz, "timeout_s": timeout_s},
+            daemon=True,
+        )
+        st.control_thread.start()
+
+    try:
+        yield
+    finally:
+        st.shutdown.set()
+        if st.control_thread is not None:
+            st.control_thread.join(timeout=2.0)
+
+
+app = FastAPI(lifespan=_lifespan)
+
+
+# @app.middleware("http")
+# async def _optional_ip_allowlist(request: Request, call_next):
+#     """Optionally block requests unless ALLOWED_CLIENT_IP matches the peer IP."""
+#     allowed = os.getenv("ALLOWED_CLIENT_IP", DEFAULT_ALLOWED_CLIENT_IP)
+#     if allowed:
+#         client_ip = request.client.host if request.client else None
+#         if client_ip not in (allowed, "127.0.0.1", "::1"):
+#             return JSONResponse(status_code=403, content={"detail": "forbidden"})
+#     return await call_next(request)
+
+
+def _get_app_state(request: Request) -> AppState:
+    """Get app state."""
+    return request.app.state.franky_state
+
+
+@app.get("/")
+def root():
+    """Landing page (HTML) showing robot/service status."""
+    robot_ip_json = JSONResponse(content=os.getenv("FRANKY_ROBOT_IP", DEFAULT_FRANKY_ROBOT_IP)).body.decode("utf-8")
+    html = LANDING_PAGE_HTML % {"robot_ip_json": robot_ip_json}
+    return HTMLResponse(content=html)
+
+
+@app.get("/health")
+def health(request: Request):
+    """Health/status endpoint."""
+    current_app_state = _get_app_state(request)
+    return {
+        "robot_connected": current_app_state.robot is not None,
+        "stop_latched": current_app_state.stop_latched,
+        "has_target": current_app_state.latest_target is not None,
+        "last_control_error": current_app_state.last_control_error,
+    }
+
+
+@app.post("/target_joint_state")
+def post_target_joint_state(payload: JointTargetIn, request: Request) -> JointTargetOut:
+    """Set the latest joint target (positions/velocities)."""
+    _validate_vec("positions", payload.positions)
+    _validate_vec("velocities", payload.velocities)
+
+    current_app_state = _get_app_state(request)
+    _require_robot(current_app_state)
+
+    now = time.time()
+    target = LatestTarget(
+        positions=[float(x) for x in payload.positions],
+        velocities=[float(x) for x in payload.velocities],
+        seq=payload.seq,
+        accepted_timestamp_s=now,
+    )
+    with current_app_state.lock:
+        current_app_state.latest_target = target
+        current_app_state.stop_latched = False
+
+    return JointTargetOut(
+        positions=target.positions,
+        velocities=target.velocities,
+        seq=target.seq,
+        accepted_timestamp_s=target.accepted_timestamp_s,
+        age_s=0.0,
+        stop_latched=False,
+    )
+
+
+@app.get("/target_joint_state")
+def get_target_joint_state(request: Request) -> JointTargetOut:
+    """Get the latest accepted target and its age."""
+    current_app_state = _get_app_state(request)
+    with current_app_state.lock:
+        latest = current_app_state.latest_target
+        stop_latched = current_app_state.stop_latched
+
+    if latest is None:
+        return JointTargetOut(
+            positions=[0.0] * N_JOINTS,
+            velocities=[0.0] * N_JOINTS,
+            seq=None,
+            accepted_timestamp_s=0.0,
+            age_s=EFFECTIVE_FLOAT_INF_SECONDS,
+            stop_latched=stop_latched,
+        )
+
+    age_s = time.time() - latest.accepted_timestamp_s
+    return JointTargetOut(
+        positions=latest.positions,
+        velocities=latest.velocities,
+        seq=latest.seq,
+        accepted_timestamp_s=latest.accepted_timestamp_s,
+        age_s=age_s,
+        stop_latched=stop_latched,
+    )
+
+
+@app.post("/stop")
+def stop(request: Request) -> StopOut:
+    """Stop the robot (joint position control mode) and latch stop."""
+    current_app_state = _get_app_state(request)
+    now = time.time()
+
+    with current_app_state.lock:
+        current_app_state.stop_latched = True
+        current_app_state.latest_target = None
+
+    if current_app_state.robot is not None:
+        try:
+            current_app_state.robot.move(franky.JointStopMotion())
+        except Exception as e:
+            current_app_state.last_control_error = f"{type(e).__name__}: {e}"
+            _try_recover_from_errors(st=current_app_state, context="stop_endpoint", exc=e)
+
+    return StopOut(stopped=True, timestamp_s=now)
+
+
+@app.post("/go_home")
+def go_home(request: Request) -> JointTargetOut:
+    """
+    Convenience endpoint for the landing page: set target joint state to HOME_POSITION.
+    This clears the stop latch and lets the background control thread drive the robot.
+    """
+    current_app_state = _get_app_state(request)
+    _require_robot(current_app_state)
+
+    now = time.time()
+    target = LatestTarget(
+        positions=[float(x) for x in HOME_POSITION],
+        velocities=[0.0] * N_JOINTS,
+        seq=None,
+        accepted_timestamp_s=now,
+    )
+    with current_app_state.lock:
+        current_app_state.latest_target = target
+        current_app_state.stop_latched = False
+
+    return JointTargetOut(
+        positions=target.positions,
+        velocities=target.velocities,
+        seq=target.seq,
+        accepted_timestamp_s=target.accepted_timestamp_s,
+        age_s=0.0,
+        stop_latched=False,
+    )
+
+
+def _to_float_list(x: Any) -> list[float]:
+    # Handle NumPy arrays directly
+    if isinstance(x, np.ndarray):
+        return [float(v) for v in x.tolist()]
+
+    # Handle other iterable containers (lists, tuples, etc.)
+    try:
+        # Strings/bytes should not be treated as sequences of numbers
+        if isinstance(x, (str, bytes)):
+            raise TypeError
+        return [float(v) for v in x]
+    except TypeError:
+        # Fallback: treat as a single scalar
+        return [float(x)]
+
+
+@app.get("/joint_state")
+def get_joint_state(request: Request):
+    st = _get_app_state(request)
+    robot = _require_robot(st)
+
+    js = getattr(robot, "current_joint_state")
+    positions = _to_float_list(js.position)
+    velocities = _to_float_list(js.velocity)
+    return {"positions": positions, "velocities": velocities}
+
+
+@app.get("/urdf")
+def get_urdf(request: Request):
+    """Return URDF if exposed by the robot wrapper."""
+    st = _get_app_state(request)
+    robot = _require_robot(st)
+
+    # Upstream docs show robot.model_urdf; also keep robot.urdf compatibility if present.
+    if hasattr(robot, "model_urdf"):
+        return {"urdf": robot.model_urdf}
+    if hasattr(robot, "urdf"):
+        return {"urdf": robot.urdf}
+    raise HTTPException(status_code=404, detail="urdf not available on this franky build")
+
+
+@app.get("/command_timeout")
+def get_command_timeout(request: Request) -> CommandTimeoutOut:
+    """Get current command timeout (seconds)."""
+    current_app_state = _get_app_state(request)
+    with current_app_state.lock:
+        return CommandTimeoutOut(command_timeout_s=current_app_state.command_timeout_s)
+
+
+@app.post("/command_timeout")
+def set_command_timeout(payload: CommandTimeoutIn, request: Request) -> CommandTimeoutOut:
+    """Set command timeout (seconds)."""
+    current_app_state = _get_app_state(request)
+    with current_app_state.lock:
+        current_app_state.command_timeout_s = float(payload.command_timeout_s)
+        return CommandTimeoutOut(command_timeout_s=current_app_state.command_timeout_s)
+
+
+def main():
+    """Entry point for franky-service CLI."""
+    uvicorn.run("droid_plus.services.franky_service:app", host="0.0.0.0", port=DEFAULT_SERVICE_PORT, workers=1)
+
+
+if __name__ == "__main__":
+    main()

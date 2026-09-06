@@ -1,0 +1,6 @@
+configs/robot.yaml
+configs/robot.env
+logs/
+__pycache__/
+*.pyc
+*.mp4

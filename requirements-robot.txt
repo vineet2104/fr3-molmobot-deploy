@@ -1,0 +1,6 @@
+# RT/robot host (arm + gripper services). Install where libfranka + franky live.
+numpy
+fastapi
+uvicorn
+pydantic
+franky-control     # provides `franky` (arm + Gripper). Pin to a version matching your libfranka/FR3 firmware.
