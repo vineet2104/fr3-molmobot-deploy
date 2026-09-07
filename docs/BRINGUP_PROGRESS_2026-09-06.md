@@ -92,3 +92,15 @@ No Viser-planned robot motion has been executed yet.
 
 Important: the planner currently models the robot/self-collision but not the
 lab table, cameras, cables, or other workspace obstacles.
+
+## 2026-09-07 UI follow-up
+
+The initial legacy UI used one status widget for both the 10 Hz robot-state
+poll and planner results. The poll immediately overwrote `planning`, `failed`,
+or `success`, making planning appear to produce no feedback. This was fixed by
+separating persistent **Robot** and **Planner/Execution** status widgets.
+
+Base-frame numeric X/Y/Z fields, an **Apply XYZ** button, and a precise
+**Nudge +Z by 5 mm** button were added. Snap now fills these coordinates and
+planning prints success/failure both in the browser and terminal. Restart
+`./viz/run_legacy.sh` after pulling the update.

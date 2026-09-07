@@ -89,7 +89,17 @@ server = viser.ViserServer(host="0.0.0.0", port=8080, label="FR3 legacy cuRobo")
 robot_urdf = ViserUrdf(server, urdf_or_path=URDF.load(str(URDF_PATH)), root_node_name="/robot")
 actuated = robot_urdf.get_actuated_joint_names()
 goal = server.scene.add_transform_controls("/goal", position=(0.4, 0.0, 0.5), wxyz=(1, 0, 0, 0), scale=0.2)
-status = server.gui.add_markdown("**Status:** waiting for arm service")
+connection_status = server.gui.add_markdown("**Robot:** waiting for arm service")
+planner_status = server.gui.add_markdown("**Planner:** idle — no plan generated")
+
+with server.gui.add_folder("Goal pose in robot base frame"):
+    goal_x = server.gui.add_number("X (m)", initial_value=0.4, step=0.001)
+    goal_y = server.gui.add_number("Y (m)", initial_value=0.0, step=0.001)
+    goal_z = server.gui.add_number("Z (m)", initial_value=0.5, step=0.001)
+    btn_apply_xyz = server.gui.add_button("Apply XYZ (keeps current goal orientation)")
+    btn_up_5mm = server.gui.add_button("Nudge +Z by 5 mm")
+    goal_orientation = server.gui.add_markdown("**Goal orientation (wxyz):** waiting")
+
 execute_enabled = server.gui.add_checkbox("ENABLE REAL EXECUTION", initial_value=False)
 btn_snap = server.gui.add_button("Snap goal to current EE")
 btn_plan = server.gui.add_button("Plan (no motion)")
@@ -116,6 +126,29 @@ def update_robot(q: list[float]) -> None:
     robot_urdf.update_cfg(np.array([cfg.get(name, 0.0) for name in actuated]))
 
 
+def sync_goal_fields() -> None:
+    goal_x.value = float(goal.position[0])
+    goal_y.value = float(goal.position[1])
+    goal_z.value = float(goal.position[2])
+    goal_orientation.content = (
+        "**Goal orientation (wxyz):** "
+        + str([round(float(x), 5) for x in goal.wxyz])
+    )
+
+
+def apply_xyz(_) -> None:
+    goal.position = (float(goal_x.value), float(goal_y.value), float(goal_z.value))
+    planner_status.content = (
+        f"**Planner:** goal updated to base-frame XYZ "
+        f"[{goal_x.value:.4f}, {goal_y.value:.4f}, {goal_z.value:.4f}] m; click Plan"
+    )
+
+
+def nudge_up_5mm(_) -> None:
+    goal_z.value = float(goal_z.value) + 0.005
+    apply_xyz(None)
+
+
 def poll() -> None:
     global current_q
     initialized = False
@@ -128,19 +161,24 @@ def poll() -> None:
                 p, quat = fk(q)
                 goal.position = tuple(float(x) for x in p)
                 goal.wxyz = tuple(float(x) for x in quat)
+                sync_goal_fields()
                 initialized = True
-            status.content = f"**Status:** connected, q={[round(x, 3) for x in q]}"
+            connection_status.content = f"**Robot:** connected, q={[round(x, 3) for x in q]}"
         time.sleep(1.0 / POLL_HZ)
 
 
 def snap(_) -> None:
     if current_q is None:
-        status.content = "**Status:** no current state"
+        planner_status.content = "**Planner:** cannot snap — no current robot state"
         return
     p, quat = fk(current_q)
     goal.position = tuple(float(x) for x in p)
     goal.wxyz = tuple(float(x) for x in quat)
-    status.content = "**Status:** goal snapped; planning/execution has not occurred"
+    sync_goal_fields()
+    planner_status.content = (
+        f"**Planner:** snapped to current EE XYZ "
+        f"[{p[0]:.4f}, {p[1]:.4f}, {p[2]:.4f}] m; no plan generated yet"
+    )
 
 
 def plan(_) -> None:
@@ -148,23 +186,25 @@ def plan(_) -> None:
     btn_execute.disabled = True
     planned_q = None
     if current_q is None:
-        status.content = "**Status:** no current state"
+        planner_status.content = "**Planner:** cannot plan — no current robot state"
         return
     q0 = np.asarray(current_q, dtype=np.float64)
     p0, _ = fk(current_q)
     gp = np.asarray(goal.position, dtype=np.float64)
     if np.linalg.norm(gp - p0) > MAX_GOAL_TRANSLATION_M:
-        status.content = f"**Status:** rejected: goal is over {MAX_GOAL_TRANSLATION_M:.2f} m from current EE"
+        planner_status.content = f"**Planner:** REJECTED — goal is over {MAX_GOAL_TRANSLATION_M:.2f} m from current EE"
         return
     start = JointState.from_position(tensor_args.to_device([q0.tolist()]), joint_names=JOINT_NAMES)
     target = Pose(
         position=tensor_args.to_device([list(goal.position)]),
         quaternion=tensor_args.to_device([list(goal.wxyz)]),
     )
-    status.content = "**Status:** planning (no motion)..."
+    planner_status.content = "**Planner:** PLANNING on GPU — no robot command is being sent..."
+    print(f"[legacy-ui] planning to XYZ={list(goal.position)}, wxyz={list(goal.wxyz)}")
     result = motion_gen.plan_single(start, target, MotionGenPlanConfig(enable_graph=True, max_attempts=4))
     if not bool(result.success.item()):
-        status.content = f"**Status:** plan failed: {result.status}"
+        planner_status.content = f"**Planner:** PLAN FAILED — {result.status}"
+        print(f"[legacy-ui] PLAN FAILED: {result.status}")
         return
     traj = result.get_interpolated_plan()
     qtraj = traj.position.detach().cpu().numpy()
@@ -173,7 +213,7 @@ def plan(_) -> None:
     qtraj = qtraj[:, :7]
     total_delta = float(np.max(np.abs(qtraj - q0[None, :])))
     if total_delta > MAX_TOTAL_JOINT_DELTA_RAD:
-        status.content = f"**Status:** rejected: planned joint displacement {total_delta:.3f} rad exceeds {MAX_TOTAL_JOINT_DELTA_RAD:.3f}"
+        planner_status.content = f"**Planner:** REJECTED — planned joint displacement {total_delta:.3f} rad exceeds {MAX_TOTAL_JOINT_DELTA_RAD:.3f}"
         return
     ee = motion_gen.compute_kinematics(
         JointState.from_position(tensor_args.to_device(qtraj), joint_names=JOINT_NAMES)
@@ -190,20 +230,27 @@ def plan(_) -> None:
     plan_start_q = q0
     plan_start_ee = p0
     btn_execute.disabled = False
-    status.content = f"**Status:** plan OK: {len(qtraj)} points, {len(qtraj)*planned_dt:.2f}s, max displacement {total_delta:.3f} rad"
+    planner_status.content = (
+        f"**Planner: PLAN SUCCESS (no motion sent)**  \n"
+        f"Goal XYZ: `[{gp[0]:.4f}, {gp[1]:.4f}, {gp[2]:.4f}] m`  \n"
+        f"Trajectory: `{len(qtraj)} points`, `{len(qtraj)*planned_dt:.2f} s`; "
+        f"max joint displacement: `{total_delta:.3f} rad`  \n"
+        "Cyan line = planned EE path. Check ENABLE REAL EXECUTION only after reviewing it."
+    )
+    print(f"[legacy-ui] PLAN SUCCESS: points={len(qtraj)}, duration={len(qtraj)*planned_dt:.2f}s, max_joint_delta={total_delta:.3f}")
 
 
 def execute_worker() -> None:
     if planned_q is None or plan_start_q is None:
         return
     if not execute_enabled.value:
-        status.content = "**Status:** execution blocked; check ENABLE REAL EXECUTION first"
+        planner_status.content = "**Execution:** BLOCKED — check ENABLE REAL EXECUTION first"
         return
     qnow = get_q()
     if qnow is None or np.max(np.abs(np.asarray(qnow) - plan_start_q)) > MAX_START_ERROR_RAD:
-        status.content = "**Status:** execution blocked; robot moved since planning—replan"
+        planner_status.content = "**Execution:** BLOCKED — robot moved since planning; snap and replan"
         return
-    status.content = "**Status:** EXECUTING REAL MOTION"
+    planner_status.content = "**Execution:** EXECUTING REAL MOTION"
     try:
         with exec_lock:
             deadline = time.monotonic()
@@ -214,12 +261,12 @@ def execute_worker() -> None:
                 deadline += planned_dt
                 time.sleep(max(0.0, deadline - time.monotonic()))
             stop()
-        status.content = "**Status:** execution complete; software stop latched"
+        planner_status.content = "**Execution:** complete; software stop latched"
         execute_enabled.value = False
     except Exception as exc:
         stop()
         execute_enabled.value = False
-        status.content = f"**Status:** execution aborted and stop sent: {exc}"
+        planner_status.content = f"**Execution:** aborted and stop sent — {exc}"
 
 
 def execute(_) -> None:
@@ -229,9 +276,11 @@ def execute(_) -> None:
 def do_stop(_) -> None:
     execute_enabled.value = False
     stop()
-    status.content = "**Status:** software STOP sent"
+    planner_status.content = "**Execution:** software STOP sent"
 
 
+btn_apply_xyz.on_click(apply_xyz)
+btn_up_5mm.on_click(nudge_up_5mm)
 btn_snap.on_click(snap)
 btn_plan.on_click(plan)
 btn_execute.on_click(execute)
