@@ -222,8 +222,10 @@ def plan(_) -> None:
         preview.remove()
     segs = np.stack([ee[:-1], ee[1:]], axis=1).astype(np.float32)
     preview = server.scene.add_line_segments(
-        "/plan_preview", points=segs,
-        colors=np.tile(np.array([0, 200, 255], dtype=np.uint8), (len(segs), 1)), line_width=3.0,
+        "/plan_preview",
+        points=segs,
+        colors=np.array([0, 200, 255], dtype=np.uint8),
+        line_width=3.0,
     )
     planned_q = qtraj
     planned_dt = float(result.interpolation_dt)
