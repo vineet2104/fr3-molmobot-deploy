@@ -47,9 +47,9 @@ LOG = logging.getLogger("franky_service")
 
 # CONSTANTS
 N_JOINTS = 7
-DEFAULT_REL_DYN = 0.2
+DEFAULT_REL_DYN = 0.05
 DEFAULT_CONTROL_HZ = 50
-DEFAULT_COMMAND_TIMEOUT_S = 10.0
+DEFAULT_COMMAND_TIMEOUT_S = 0.5
 DEFAULT_ALLOWED_CLIENT_IP = "192.168.1.123"
 DEFAULT_FRANKY_ROBOT_IP = "172.16.0.3"
 DEFAULT_LOG_LEVEL = "INFO"
@@ -520,6 +520,21 @@ def _get_env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _get_relative_dynamics() -> tuple[float, float, float]:
+    """Read FRANKY_REL_DYN as one factor or velocity,acceleration,jerk."""
+    raw = os.getenv("FRANKY_REL_DYN", str(DEFAULT_REL_DYN)).strip()
+    parts = [part.strip() for part in raw.split(",")]
+    if len(parts) == 1:
+        values = (float(parts[0]),) * 3
+    elif len(parts) == 3:
+        values = tuple(float(part) for part in parts)
+    else:
+        raise ValueError("FRANKY_REL_DYN must be one number or three comma-separated numbers")
+    if any(value <= 0.0 or value > 1.0 for value in values):
+        raise ValueError("FRANKY_REL_DYN factors must be in the interval (0, 1]")
+    return values
+
+
 def _validate_vec(name: str, values: list[float], n: int = N_JOINTS) -> None:
     """Validate a numeric vector payload."""
     if len(values) != n:
@@ -666,7 +681,7 @@ async def _lifespan(app: FastAPI):
     logging.basicConfig(level=os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL))
 
     robot_ip = os.getenv("FRANKY_ROBOT_IP", DEFAULT_FRANKY_ROBOT_IP)
-    rel_dyn = _get_env_float("FRANKY_REL_DYN", DEFAULT_REL_DYN)
+    rel_dyn = _get_relative_dynamics()
     control_hz = _get_env_int("CONTROL_HZ", DEFAULT_CONTROL_HZ)
     timeout_s = _get_env_float("COMMAND_TIMEOUT_S", DEFAULT_COMMAND_TIMEOUT_S)
 
@@ -681,9 +696,15 @@ async def _lifespan(app: FastAPI):
         command_timeout_s=timeout_s,
     )
     app.state.franky_state = st
+    LOG.info(
+        "Connecting to robot_ip=%s with relative dynamics=%s, control_hz=%s, timeout_s=%s",
+        robot_ip,
+        rel_dyn,
+        control_hz,
+        timeout_s,
+    )
     st.robot = franky.Robot(robot_ip)
-    st.robot.relative_dynamics_factor = franky.RelativeDynamicsFactor(0.3, 0.2, 0.1)
-
+    st.robot.relative_dynamics_factor = franky.RelativeDynamicsFactor(*rel_dyn)
 
     # Start background control thread (single uvicorn worker).
     if st.robot is not None:
