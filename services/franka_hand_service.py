@@ -67,7 +67,7 @@ def _connect(robot_ip: str) -> None:
     # franky exposes the Franka Hand as franky.Gripper(<robot_ip>)
     STATE.gripper = franky.Gripper(robot_ip)
     try:
-        STATE.max_width = float(STATE.gripper.width) if hasattr(STATE.gripper, "width") else DEFAULT_MAX_WIDTH_M
+        STATE.max_width = float(STATE.gripper.max_width)
     except Exception:
         STATE.max_width = DEFAULT_MAX_WIDTH_M
 

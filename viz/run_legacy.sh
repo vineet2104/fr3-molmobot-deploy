@@ -12,6 +12,7 @@ source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 [ -f "$ENV_FILE" ] && source "$ENV_FILE"
 export FRANKY_SERVICE_URL="${FRANKY_SERVICE_URL:-${FRANKY_URL:-http://192.168.123.249:54321}}"
+export FRANKA_HAND_SERVICE_URL="${FRANKA_HAND_SERVICE_URL:-${HAND_URL:-http://192.168.123.249:54324}}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.2}"
 export PATH="$CUDA_HOME/bin:$PATH"
 

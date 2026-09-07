@@ -25,6 +25,10 @@ from curobo.types.robot import JointState
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
 
 FRANKY_URL = os.environ.get("FRANKY_SERVICE_URL", "http://127.0.0.1:54321")
+HAND_URL = os.environ.get(
+    "FRANKA_HAND_SERVICE_URL",
+    os.environ.get("HAND_URL", "http://127.0.0.1:54324"),
+)
 URDF_PATH = Path(os.environ.get("FRANKA_URDF_PATH", str(Path(__file__).parent / "assets/franka_panda.urdf")))
 POLL_HZ = 10.0
 READ_TIMEOUT = 2.0
@@ -109,6 +113,16 @@ btn_plan = server.gui.add_button("Plan (no motion)")
 btn_execute = server.gui.add_button("Execute planned path")
 btn_execute.disabled = True
 btn_stop = server.gui.add_button("STOP")
+
+with server.gui.add_folder("Franka Hand"):
+    gripper_status = server.gui.add_markdown("**Hand:** waiting for service")
+    gripper_enabled = server.gui.add_checkbox("ENABLE GRIPPER COMMANDS", initial_value=False)
+    grasp_width = server.gui.add_number("Grasp width (m)", initial_value=0.02, min=0.0, max=0.08, step=0.005)
+    grasp_force = server.gui.add_number("Grasp force (N)", initial_value=10.0, min=1.0, max=40.0, step=1.0)
+    btn_gripper_open = server.gui.add_button("Open hand")
+    btn_gripper_close = server.gui.add_button("Close / grasp")
+    btn_gripper_stop = server.gui.add_button("STOP hand")
+
 warning = server.gui.add_markdown(
     "**Warning:** cuRobo checks its robot model, joint limits, reachability, and self-collision, "
     "but no table, floor, cameras, cables, or lab obstacles are modeled. A successful plan is "
@@ -291,6 +305,62 @@ def execute(_) -> None:
     threading.Thread(target=execute_worker, daemon=True).start()
 
 
+def gripper_request(path: str, payload: dict | None = None) -> None:
+    if not gripper_enabled.value:
+        gripper_status.content = "**Hand:** command blocked — check ENABLE GRIPPER COMMANDS"
+        return
+    try:
+        r = requests.post(f"{HAND_URL}/{path}", json=payload, timeout=WRITE_TIMEOUT)
+        r.raise_for_status()
+        gripper_status.content = f"**Hand:** `{path}` accepted; waiting for completion"
+        gripper_enabled.value = False
+    except Exception as exc:
+        gripper_status.content = f"**Hand:** command failed — {exc}"
+        gripper_enabled.value = False
+
+
+def open_gripper(_) -> None:
+    gripper_request("gripper_open", {"speed": 0.05})
+
+
+def close_gripper(_) -> None:
+    gripper_request(
+        "gripper_grasp",
+        {
+            "width_m": float(grasp_width.value),
+            "speed": 0.05,
+            "force": float(grasp_force.value),
+            "epsilon_inner": 0.02,
+            "epsilon_outer": 0.02,
+        },
+    )
+
+
+def stop_gripper(_) -> None:
+    try:
+        requests.post(f"{HAND_URL}/gripper_stop", timeout=WRITE_TIMEOUT).raise_for_status()
+        gripper_status.content = "**Hand:** stop sent"
+    except Exception as exc:
+        gripper_status.content = f"**Hand:** stop failed — {exc}"
+    finally:
+        gripper_enabled.value = False
+
+
+def poll_gripper() -> None:
+    while True:
+        try:
+            data = requests.get(f"{HAND_URL}/health", timeout=READ_TIMEOUT).json()
+            error = data.get("error")
+            gripper_status.content = (
+                f"**Hand:** {'busy' if data.get('busy') else 'ready'}, "
+                f"width={data.get('width_m')}, grasped={data.get('is_grasped')}"
+                + (f", error={error}" if error else "")
+            )
+        except Exception:
+            gripper_status.content = f"**Hand:** service unavailable at `{HAND_URL}`"
+        time.sleep(0.5)
+
+
 def do_stop(_) -> None:
     execute_enabled.value = False
     stop()
@@ -303,6 +373,11 @@ btn_snap.on_click(snap)
 btn_plan.on_click(plan)
 btn_execute.on_click(execute)
 btn_stop.on_click(do_stop)
+btn_gripper_open.on_click(open_gripper)
+btn_gripper_close.on_click(close_gripper)
+btn_gripper_stop.on_click(stop_gripper)
 threading.Thread(target=poll, daemon=True).start()
+threading.Thread(target=poll_gripper, daemon=True).start()
+print(f"[legacy-ui] Franka Hand service: {HAND_URL}")
 print("[legacy-ui] ready at http://0.0.0.0:8080 (execution disabled by default)")
 server.sleep_forever()
