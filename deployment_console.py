@@ -313,9 +313,14 @@ class RolloutManager:
                 raise RuntimeError(f"requires absolute joint_pos actions; got {metadata.get('action_type')}")
             if cfg.get("jpeg_obs", False) and not metadata.get("accepts_jpeg", False):
                 raise RuntimeError("JPEG observations requested but model metadata does not advertise accepts_jpeg=True")
-            camera_names = metadata.get("camera_names")
-            if camera_names and list(camera_names) != ["exo_front", "wrist"]:
-                raise RuntimeError(f"model camera_names must be ['exo_front','wrist']; got {camera_names}")
+            camera_names = list(metadata.get("camera_names") or ["exo_front", "wrist"])
+            if len(camera_names) != 2 or not all(isinstance(name, str) and name for name in camera_names):
+                raise RuntimeError(f"model must advertise exactly two valid camera names; got {camera_names}")
+            exo_camera_key, wrist_camera_key = camera_names
+            self.log(
+                f"camera mapping: physical ZED exterior -> {exo_camera_key!r}; "
+                f"physical RealSense wrist -> {wrist_camera_key!r}"
+            )
 
             last_gripper_vote = None
             gripper_votes = 0
@@ -337,8 +342,8 @@ class RolloutManager:
                     width = float(cfg.get("dummy_gripper_width_m", 0.08))
                 grip_state = _gripper_state(width, cfg.get("gripper_state_mode", "robotiq_angle"))
                 obs = {
-                    "exo_front": exo_rgb,
-                    "wrist": wrist_rgb,
+                    exo_camera_key: exo_rgb,
+                    wrist_camera_key: wrist_rgb,
                     "qpos": {"arm": arm_q, "gripper": np.asarray([grip_state], dtype=np.float32)},
                     "task": cfg["task"].strip(),
                 }

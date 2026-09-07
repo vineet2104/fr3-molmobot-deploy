@@ -45,9 +45,12 @@ at 15 Hz, then captures fresh images/state and performs the next blocking
 inference. Inference delay is allowed; there is no overlapping/double-buffered
 inference.
 
-The GPU server should advertise `camera_names=["exo_front", "wrist"]` and
-`action_type="joint_pos"`. Launch the bridge with action horizon 16, execute
-horizon 8, and chunk response enabled.
+The console uses the two camera names advertised by model metadata in order:
+physical exterior maps to the first name and physical wrist to the second. This
+supports both `["exo_front", "wrist"]` and the official Img-DROID names
+`["exo_camera_1", "wrist_camera"]`. The server must advertise exactly two
+camera names and `action_type="joint_pos"`. Launch it with action horizon 16
+and chunk response enabled; the console always executes only the first 8.
 
 ## Interface
 
