@@ -34,6 +34,12 @@ POLL_HZ = 10.0
 READ_TIMEOUT = 2.0
 WRITE_TIMEOUT = 3.0
 MAX_START_ERROR_RAD = 0.05
+# Initial joint configuration hard-coded by the previous FR3Py C++ bridge
+# (fr3_bridge/src/fr3_joint_interface/fr3_joint_interface.cpp).
+FR3PY_HOME_Q = np.array(
+    [0.0, -np.pi / 4.0, 0.0, -3.0 * np.pi / 4.0, 0.0, np.pi / 2.0, np.pi / 4.0],
+    dtype=np.float64,
+)
 # Optional site/operator guards. A value <= 0 disables the guard and lets
 # cuRobo determine reachability, joint limits, and self-collision feasibility.
 MAX_TOTAL_JOINT_DELTA_RAD = float(os.environ.get("VIZ_MAX_TOTAL_JOINT_DELTA_RAD", "0"))
@@ -112,6 +118,11 @@ btn_snap = server.gui.add_button("Snap goal to current EE")
 btn_plan = server.gui.add_button("Plan (no motion)")
 btn_execute = server.gui.add_button("Execute planned path")
 btn_execute.disabled = True
+btn_home = server.gui.add_button("Go Home (FR3Py base pose)")
+home_note = server.gui.add_markdown(
+    "Home q: `[0, -0.7854, 0, -2.3562, 0, 1.5708, 0.7854]` — plans first; "
+    "requires ENABLE REAL EXECUTION."
+)
 btn_stop = server.gui.add_button("STOP")
 
 with server.gui.add_folder("Franka Hand"):
@@ -272,6 +283,80 @@ def plan(_) -> None:
     print(f"[legacy-ui] PLAN SUCCESS: points={len(qtraj)}, duration={len(qtraj)*planned_dt:.2f}s, max_joint_delta={total_delta:.3f}")
 
 
+def go_home(_) -> None:
+    """Plan to the prior FR3Py initial pose, then execute if explicitly enabled."""
+    global planned_q, planned_dt, plan_start_q, plan_start_ee, preview
+    if not execute_enabled.value:
+        planner_status.content = (
+            "**Go Home:** blocked — check ENABLE REAL EXECUTION, then click Go Home again"
+        )
+        return
+    if current_q is None:
+        planner_status.content = "**Go Home:** blocked — no current robot state"
+        execute_enabled.value = False
+        return
+
+    q0 = np.asarray(current_q, dtype=np.float64)
+    start = JointState.from_position(
+        tensor_args.to_device([q0.tolist()]), joint_names=JOINT_NAMES
+    )
+    goal_state = JointState.from_position(
+        tensor_args.to_device([FR3PY_HOME_Q.tolist()]), joint_names=JOINT_NAMES
+    )
+    planner_status.content = "**Go Home:** planning to the validated FR3Py base pose (no motion yet)..."
+    print(f"[legacy-ui] planning FR3Py home: {FR3PY_HOME_Q.round(4).tolist()}")
+    result = motion_gen.plan_single_js(
+        start,
+        goal_state,
+        MotionGenPlanConfig(enable_graph=True, max_attempts=4),
+    )
+    if not bool(result.success.item()):
+        planner_status.content = f"**Go Home:** PLAN FAILED — {result.status}"
+        execute_enabled.value = False
+        print(f"[legacy-ui] HOME PLAN FAILED: {result.status}")
+        return
+
+    traj = result.get_interpolated_plan()
+    qtraj = traj.position.detach().cpu().numpy()
+    while qtraj.ndim > 2:
+        qtraj = qtraj[0]
+    qtraj = qtraj[:, :7]
+    total_delta = float(np.max(np.abs(qtraj - q0[None, :])))
+    if MAX_TOTAL_JOINT_DELTA_RAD > 0 and total_delta > MAX_TOTAL_JOINT_DELTA_RAD:
+        planner_status.content = (
+            f"**Go Home:** rejected by optional operator guard — {total_delta:.3f} rad exceeds "
+            f"{MAX_TOTAL_JOINT_DELTA_RAD:.3f} rad"
+        )
+        execute_enabled.value = False
+        return
+
+    ee = motion_gen.compute_kinematics(
+        JointState.from_position(tensor_args.to_device(qtraj), joint_names=JOINT_NAMES)
+    ).ee_pos_seq.detach().cpu().numpy().reshape(-1, 3)
+    if preview is not None:
+        preview.remove()
+    segs = np.stack([ee[:-1], ee[1:]], axis=1).astype(np.float32)
+    preview = server.scene.add_line_segments(
+        "/plan_preview",
+        points=segs,
+        colors=np.array([255, 190, 0], dtype=np.uint8),
+        line_width=3.0,
+    )
+    planned_q = qtraj
+    planned_dt = float(result.interpolation_dt)
+    plan_start_q = q0
+    plan_start_ee = ee[0]
+    planner_status.content = (
+        f"**Go Home:** plan success — executing `{len(qtraj)}` points over "
+        f"`{len(qtraj) * planned_dt:.2f} s`; max joint displacement `{total_delta:.3f} rad`"
+    )
+    print(
+        f"[legacy-ui] HOME PLAN SUCCESS: points={len(qtraj)}, "
+        f"duration={len(qtraj) * planned_dt:.2f}s, max_joint_delta={total_delta:.3f}"
+    )
+    threading.Thread(target=execute_worker, daemon=True).start()
+
+
 def execute_worker() -> None:
     if planned_q is None or plan_start_q is None:
         return
@@ -372,6 +457,7 @@ btn_up_5mm.on_click(nudge_up_5mm)
 btn_snap.on_click(snap)
 btn_plan.on_click(plan)
 btn_execute.on_click(execute)
+btn_home.on_click(go_home)
 btn_stop.on_click(do_stop)
 btn_gripper_open.on_click(open_gripper)
 btn_gripper_close.on_click(close_gripper)
