@@ -51,7 +51,8 @@ services/   franky_service.py (arm :54321), franka_hand_service.py (:54324),
             robotiq_gripper_service.py (optional :54323)
 client/     run_molmobot_official.py, run_molmobot_ft.py, client_example.py
 server/     serve_bridge.py, bridge_policy.py (+ README) — runs on the GPU host
-service_console.py   FastAPI web console (workstation; endpoint-driven, subprocesses client/)
+deployment_console.py  mixed ZED+RealSense live UI and 16→8 closed-loop rollout (workstation)
+service_console.py   older subprocess-based FastAPI console (kept for reference)
 service_console_reference.py  original single-box console (reference only, not runnable here)
 viz/        server.py (viser 3D UI + cuRobo), bundled Panda URDF+meshes (workstation)
 configs/    robot.example.yaml, env.example  (copy -> robot.yaml / robot.env)
@@ -90,12 +91,13 @@ docs/       MIGRATION_PLAN.md (authoritative bring-up), gripper/IO conventions,
    # then a real run:
    ./scripts/run_molmobot_ft.sh "Pick up the pineapple slices can"
    ```
-6. **Console (optional webpage)** on the workstation:
+6. **Deployment console** on the workstation (mixed ZED exterior + RealSense wrist):
    ```bash
-   python service_console.py --port 7070    # open http://<workstation-ip>:7070
+   ./scripts/setup_deployment_console.sh    # once
+   ./scripts/launch_deployment_console.sh   # open http://<workstation-ip>:7071
    ```
-   (See `docs/S2R_SERVICE.md` if present. The console assumes model servers are
-   already running on the GPU host; set endpoints in the UI.)
+   Enter the remote model IP/port, experiment name and task in the UI. Start
+   with **Dry run** enabled. See `docs/DEPLOYMENT_CONSOLE.md`.
 
 ## Gripper note (IMPORTANT)
 The lab uses the **Franka Hand** (`--gripper panda`), not the Robotiq 2F-85 the
