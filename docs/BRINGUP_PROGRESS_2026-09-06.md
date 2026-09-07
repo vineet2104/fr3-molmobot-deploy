@@ -72,10 +72,14 @@ Run: `./viz/run_legacy.sh`
 - started Viser on `http://192.168.123.203:8080`;
 - remained execution-disabled by default.
 
-The legacy UI limits a goal to 10 cm from the planning start, rejects plans
-whose total joint displacement exceeds 0.35 rad, verifies that the robot has
-not moved more than 0.05 rad before execution, and latches `/stop` after a
-trajectory. These are supplemental checks, not a safety certification.
+The legacy UI initially limited a goal to 10 cm and total joint displacement
+to 0.35 rad during bring-up. After the first 5 mm planning test passed, those
+two guards were made optional so cuRobo determines reachability, configured
+joint limits, and self-collision feasibility. Set `VIZ_MAX_GOAL_TRANSLATION_M`
+and/or `VIZ_MAX_TOTAL_JOINT_DELTA_RAD` to positive values to re-enable operator
+limits. The UI still verifies that the robot has not moved more than 0.05 rad
+from the plan start before execution and latches `/stop` after a trajectory.
+These are supplemental checks, not a safety certification.
 
 ## Stop point / tomorrow's first actions
 

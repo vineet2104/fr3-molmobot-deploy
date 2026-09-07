@@ -1,8 +1,9 @@
 """Minimal Viser UI for legacy cuRobo v0.7.8 on a Turing workstation.
 
 Starts read-only. Planning never moves the robot. Execution requires explicitly
-checking the enable box and is limited to goals near the state used to plan.
+checking the enable box and verifies the robot is still at the plan's start state.
 No lab obstacles are modeled: visually verify the path and keep the e-stop ready.
+Optional displacement guards can be enabled through environment variables.
 """
 from __future__ import annotations
 
@@ -29,8 +30,10 @@ POLL_HZ = 10.0
 READ_TIMEOUT = 2.0
 WRITE_TIMEOUT = 3.0
 MAX_START_ERROR_RAD = 0.05
-MAX_TOTAL_JOINT_DELTA_RAD = 0.35
-MAX_GOAL_TRANSLATION_M = 0.10
+# Optional site/operator guards. A value <= 0 disables the guard and lets
+# cuRobo determine reachability, joint limits, and self-collision feasibility.
+MAX_TOTAL_JOINT_DELTA_RAD = float(os.environ.get("VIZ_MAX_TOTAL_JOINT_DELTA_RAD", "0"))
+MAX_GOAL_TRANSLATION_M = float(os.environ.get("VIZ_MAX_GOAL_TRANSLATION_M", "0"))
 
 print("[legacy-ui] loading cuRobo v0.7.8 MotionGen...")
 tensor_args = TensorDeviceType(device=torch.device("cuda:0"))
@@ -107,7 +110,9 @@ btn_execute = server.gui.add_button("Execute planned path")
 btn_execute.disabled = True
 btn_stop = server.gui.add_button("STOP")
 warning = server.gui.add_markdown(
-    "**Warning:** no table or lab obstacles are modeled. Execution is limited but still real motion."
+    "**Warning:** cuRobo checks its robot model, joint limits, reachability, and self-collision, "
+    "but no table, floor, cameras, cables, or lab obstacles are modeled. A successful plan is "
+    "not automatically safe in the physical workspace."
 )
 
 current_q: list[float] | None = None
@@ -191,8 +196,15 @@ def plan(_) -> None:
     q0 = np.asarray(current_q, dtype=np.float64)
     p0, _ = fk(current_q)
     gp = np.asarray(goal.position, dtype=np.float64)
-    if np.linalg.norm(gp - p0) > MAX_GOAL_TRANSLATION_M:
-        planner_status.content = f"**Planner:** REJECTED — goal is over {MAX_GOAL_TRANSLATION_M:.2f} m from current EE"
+    goal_distance = float(np.linalg.norm(gp - p0))
+    if not np.isfinite(gp).all():
+        planner_status.content = "**Planner:** REJECTED — goal XYZ contains NaN or infinity"
+        return
+    if MAX_GOAL_TRANSLATION_M > 0 and goal_distance > MAX_GOAL_TRANSLATION_M:
+        planner_status.content = (
+            f"**Planner:** REJECTED by optional operator guard — goal distance "
+            f"{goal_distance:.3f} m exceeds {MAX_GOAL_TRANSLATION_M:.3f} m"
+        )
         return
     start = JointState.from_position(tensor_args.to_device([q0.tolist()]), joint_names=JOINT_NAMES)
     target = Pose(
@@ -212,8 +224,11 @@ def plan(_) -> None:
         qtraj = qtraj[0]
     qtraj = qtraj[:, :7]
     total_delta = float(np.max(np.abs(qtraj - q0[None, :])))
-    if total_delta > MAX_TOTAL_JOINT_DELTA_RAD:
-        planner_status.content = f"**Planner:** REJECTED — planned joint displacement {total_delta:.3f} rad exceeds {MAX_TOTAL_JOINT_DELTA_RAD:.3f}"
+    if MAX_TOTAL_JOINT_DELTA_RAD > 0 and total_delta > MAX_TOTAL_JOINT_DELTA_RAD:
+        planner_status.content = (
+            f"**Planner:** REJECTED by optional operator guard — planned joint displacement "
+            f"{total_delta:.3f} rad exceeds {MAX_TOTAL_JOINT_DELTA_RAD:.3f} rad"
+        )
         return
     ee = motion_gen.compute_kinematics(
         JointState.from_position(tensor_args.to_device(qtraj), joint_names=JOINT_NAMES)
@@ -235,6 +250,7 @@ def plan(_) -> None:
     planner_status.content = (
         f"**Planner: PLAN SUCCESS (no motion sent)**  \n"
         f"Goal XYZ: `[{gp[0]:.4f}, {gp[1]:.4f}, {gp[2]:.4f}] m`  \n"
+        f"Cartesian goal distance: `{goal_distance:.3f} m`  \n"
         f"Trajectory: `{len(qtraj)} points`, `{len(qtraj)*planned_dt:.2f} s`; "
         f"max joint displacement: `{total_delta:.3f} rad`  \n"
         "Cyan line = planned EE path. Check ENABLE REAL EXECUTION only after reviewing it."
