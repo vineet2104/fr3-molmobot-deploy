@@ -47,6 +47,20 @@ python server.py                     # open http://<workstation-ip>:8080
 # or: ./run.sh  (tmux session, activates the `franky` conda env + CUDA_HOME)
 ```
 
+### Legacy RTX 2080 Ti path
+
+The lab workstation's Turing GPU/driver cannot run current cuRobo V2. A
+minimal, execution-disabled-by-default v0.7.8 UI is available temporarily:
+
+```bash
+./scripts/setup_legacy_viz.sh  # once, from the repository root
+./viz/run_legacy.sh
+# open http://<workstation-ip>:8080
+```
+
+See `docs/BRINGUP_PROGRESS_2026-09-06.md`. Use `server_legacy.py` only with the
+pinned environment created by the setup script.
+
 ## Safety
 Planning is offline; **Execute streams real motion** to the arm. Same rules as a
 rollout: e-stop within reach, joints unlocked, FCI active, start with the
