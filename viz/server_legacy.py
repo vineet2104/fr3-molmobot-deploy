@@ -40,6 +40,9 @@ FR3PY_HOME_Q = np.array(
     [0.0, -np.pi / 4.0, 0.0, -3.0 * np.pi / 4.0, 0.0, np.pi / 2.0, np.pi / 4.0],
     dtype=np.float64,
 )
+# Lab-selected Cartesian home in the robot base frame. Its orientation is
+# computed by FK from FR3PY_HOME_Q, so only the position is overridden.
+HOME_POSITION_XYZ = np.array([0.378, 0.432, 0.317], dtype=np.float64)
 # Optional site/operator guards. A value <= 0 disables the guard and lets
 # cuRobo determine reachability, joint limits, and self-collision feasibility.
 MAX_TOTAL_JOINT_DELTA_RAD = float(os.environ.get("VIZ_MAX_TOTAL_JOINT_DELTA_RAD", "0"))
@@ -118,10 +121,10 @@ btn_snap = server.gui.add_button("Snap goal to current EE")
 btn_plan = server.gui.add_button("Plan (no motion)")
 btn_execute = server.gui.add_button("Execute planned path")
 btn_execute.disabled = True
-btn_home = server.gui.add_button("Go Home (FR3Py base pose)")
+btn_home = server.gui.add_button("Go Home (configured Cartesian pose)")
 home_note = server.gui.add_markdown(
-    "Home q: `[0, -0.7854, 0, -2.3562, 0, 1.5708, 0.7854]` — plans first; "
-    "requires ENABLE REAL EXECUTION."
+    "Home XYZ: `[0.378, 0.432, 0.317] m` in robot base frame; orientation is "
+    "taken from the default FR3Py home q. Plans first and requires ENABLE REAL EXECUTION."
 )
 btn_stop = server.gui.add_button("STOP")
 
@@ -284,7 +287,7 @@ def plan(_) -> None:
 
 
 def go_home(_) -> None:
-    """Plan to the prior FR3Py initial pose, then execute if explicitly enabled."""
+    """Plan to configured XYZ with the prior FR3Py home's orientation, then execute."""
     global planned_q, planned_dt, plan_start_q, plan_start_ee, preview
     if not execute_enabled.value:
         planner_status.content = (
@@ -300,14 +303,24 @@ def go_home(_) -> None:
     start = JointState.from_position(
         tensor_args.to_device([q0.tolist()]), joint_names=JOINT_NAMES
     )
-    goal_state = JointState.from_position(
-        tensor_args.to_device([FR3PY_HOME_Q.tolist()]), joint_names=JOINT_NAMES
+    # Compute the orientation of the old FR3Py home configuration, but replace
+    # its translation with the operator-selected Cartesian home position.
+    _, home_quat = fk(FR3PY_HOME_Q.tolist())
+    home_pose = Pose(
+        position=tensor_args.to_device([HOME_POSITION_XYZ.tolist()]),
+        quaternion=tensor_args.to_device([home_quat.tolist()]),
     )
-    planner_status.content = "**Go Home:** planning to the validated FR3Py base pose (no motion yet)..."
-    print(f"[legacy-ui] planning FR3Py home: {FR3PY_HOME_Q.round(4).tolist()}")
-    result = motion_gen.plan_single_js(
+    planner_status.content = (
+        "**Go Home:** planning to configured Cartesian home with FR3Py home orientation "
+        "(no motion yet)..."
+    )
+    print(
+        f"[legacy-ui] planning Cartesian home: xyz={HOME_POSITION_XYZ.tolist()}, "
+        f"wxyz={home_quat.round(6).tolist()}"
+    )
+    result = motion_gen.plan_single(
         start,
-        goal_state,
+        home_pose,
         MotionGenPlanConfig(enable_graph=True, max_attempts=4),
     )
     if not bool(result.success.item()):

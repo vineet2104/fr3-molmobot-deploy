@@ -107,7 +107,9 @@ separating persistent **Robot** and **Planner/Execution** status widgets.
 Base-frame numeric X/Y/Z fields, an **Apply XYZ** button, and a precise
 **Nudge +Z by 5 mm** button were added. Snap now fills these coordinates and
 planning prints success/failure both in the browser and terminal. A guarded
-**Go Home (FR3Py base pose)** button was later added using the previous bridge's
-hard-coded initial configuration `[0, -pi/4, 0, -3pi/4, 0, pi/2, pi/4]`. It
-plans with cuRobo before moving and requires **ENABLE REAL EXECUTION**.
+**Go Home** button was later added. Its configured target position is
+`[0.378, 0.432, 0.317] m` in the robot base frame, while its orientation is
+computed by FK from the previous bridge's hard-coded initial configuration
+`[0, -pi/4, 0, -3pi/4, 0, pi/2, pi/4]`. It plans with cuRobo before moving and
+requires **ENABLE REAL EXECUTION**.
 Restart `./viz/run_legacy.sh` after pulling updates.
