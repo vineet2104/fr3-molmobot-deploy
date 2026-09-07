@@ -7,3 +7,4 @@ __pycache__/
 rt_host_inventory_*.txt
 rt_fr3_stack_*.txt
 rt_fr3_containers_*.txt
+camera_snapshots/
